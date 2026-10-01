@@ -641,14 +641,15 @@ class GPT(nn.Module):
             # Targets and prefix targets arrive as positions in the candidate set, built on the host;
             # target_pos carries the MTP lookahead rows (sliced by train_gpt.py).
             loss_per_token = softcapped_ce(
-                x.view(-1, x.size(-1)), sampled_loss.rows.t(), mtp_weights, prefix_weight,
-                sampled_loss.target_pos, sampled_loss.prefix_pos, sampled_loss.vocab_pos,
+                x.view(-1, x.size(-1)), sampled_loss.rows.t(), self.lm_head.weight, mtp_weights,
+                prefix_weight, sampled_loss.target_pos, sampled_loss.prefix_pos,
+                sampled_loss.vocab_pos,
             )
         elif self.training:
             n = x.size(1)
             prefix_target_seq = self.prefix_table[target_seq[:n]]
             loss_per_token = softcapped_ce(
-                x.view(-1, x.size(-1)), self.lm_head.weight, mtp_weights, prefix_weight,
+                x.view(-1, x.size(-1)), self.lm_head.weight, None, mtp_weights, prefix_weight,
                 target_seq, prefix_target_seq, None,
             )
         else:

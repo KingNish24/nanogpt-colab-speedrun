@@ -235,8 +235,10 @@ class SampledSoftmax:
         """Copy the candidates' rows out of the lm_head weight and rebuild C's inverse map."""
         cand = self.candidates[:P]
         # The weight is (D, V): the candidates' columns are the (D, P) row table, then one tiled
-        # transpose into the (P, D) rows slab (the loss's forward operand).
-        torch.index_select(lm_head_weight, 1, cand, out=inputs.rows_t)
+        # transpose into the (P, D) rows slab (the loss's forward operand). The slab stays outside
+        # autograd (record #360 gathered from a grad-free fp8 cache); the loss routes the lm_head
+        # gradient through its dedicated carrier input, so detach the source for the out= copy.
+        torch.index_select(lm_head_weight.detach(), 1, cand, out=inputs.rows_t)
         transpose_copy(inputs.rows_t, inputs.rows)
         inputs.vocab_pos.fill_(-1)
         inputs.vocab_pos.index_copy_(0, cand, self.arange[:P])

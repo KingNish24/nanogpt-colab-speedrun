@@ -35,6 +35,13 @@ class SoftcappedCE(torch.autograd.Function):
     """Per-token softcapped CE over `weight`'s columns, with MTP and prefix targets.
 
     x: [n, D] fp16; weight: [D, M] fp16 (lm_head, or a sampled candidate slab for M = P).
+    lm_head_weight: [D, V] fp16, the live lm_head weight. It is unused in the forward; it only
+        carries the backward's gradient on the sampled path (record #360's fused kernel did the
+        same: its lm_head input "only carries that gradient"). The sampled rows slab is a reused
+        buffer that must stay outside autograd (hence the forward can never route grad through it),
+        so the backward scatters the [D, P] candidate gradient into a dense [D, V] one and returns
+        it in this slot. The full-softmax path passes None here and takes its [D, V] gradient in
+        the `weight` slot instead.
     mtp_weights: [K] fp32; prefix_weight: 0-dim fp32 tensor or python float.
     target_cols: [L] int64 class ids (full softmax) or candidate positions (sampled), L >= n;
         row t's k-th target is target_cols[t + k], valid while t + k < L (padding is -1).
@@ -44,7 +51,8 @@ class SoftcappedCE(torch.autograd.Function):
     Returns losses: [n] fp32.
     """
     @staticmethod
-    def forward(ctx, x, weight, mtp_weights, prefix_weight, target_cols, prefix_cols, vocab_pos):
+    def forward(ctx, x, weight, lm_head_weight, mtp_weights, prefix_weight, target_cols,
+                prefix_cols, vocab_pos):
         n, D = x.shape
         M = weight.shape[1]
         K = int(mtp_weights.numel())
@@ -122,15 +130,18 @@ class SoftcappedCE(torch.autograd.Function):
         dx = dx.to(x.dtype)
         dW = dW.to(weight.dtype)
         if vocab_pos is not None:
-            # Sampled: scatter the [D, P] candidate gradient into a dense [D, V] one.
+            # Sampled: the rows slab is a grad-free buffer, so the candidate gradient cannot be
+            # returned in the `weight` slot (autograd would discard it); scatter it dense and land
+            # it on the lm_head_weight carrier instead.
             dense = torch.zeros(D, int(vocab_pos.numel()), dtype=dW.dtype, device=dW.device)
             keep = vocab_pos >= 0
             dense[:, keep] = dW[:, vocab_pos[keep].long()]
-            dW = dense
-        return dx, dW, None, None, None, None, None
+            return dx, None, dense, None, None, None, None, None
+        return dx, dW, None, None, None, None, None, None
 
 
-def softcapped_ce(x, weight, mtp_weights, prefix_weight, target_cols, prefix_cols, vocab_pos=None):
+def softcapped_ce(x, weight, lm_head_weight, mtp_weights, prefix_weight, target_cols, prefix_cols,
+                  vocab_pos=None):
     """SoftcappedCE over `weight`'s columns; see SoftcappedCE."""
-    return SoftcappedCE.apply(x, weight, mtp_weights.float(), prefix_weight,
+    return SoftcappedCE.apply(x, weight, lm_head_weight, mtp_weights.float(), prefix_weight,
                               target_cols, prefix_cols, vocab_pos)
