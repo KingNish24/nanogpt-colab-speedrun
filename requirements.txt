@@ -1,0 +1,9 @@
+# T4 port: torch and triton come from the Colab runtime image (port_t4.ipynb asserts the build
+# targets sm75/Turing before anything else). Do NOT add torch here -- the notebook's venv runs on
+# --system-site-packages precisely so the preinstalled CUDA torch + bundled triton are reused.
+numpy
+tiktoken
+datasets
+huggingface-hub
+tqdm
+setuptools
