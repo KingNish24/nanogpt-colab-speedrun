@@ -20,7 +20,7 @@ T4-port differences from record #360's 8xH100 driver:
 import os
 import sys
 
-os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 from track_1_short.run_log import log_environment, read_source, start_run_log
 
@@ -268,6 +268,8 @@ def main():
     sampled_softmax.reset()
     del warmup_batches, initial_state
     model.train()
+    print0(f"Memory after warmup: {torch.cuda.memory_allocated() / 2**30:.2f} GiB allocated, "
+           f"{torch.cuda.memory_reserved() / 2**30:.2f} GiB reserved", console=True)
 
     ########################################
     #        Training and validation       #

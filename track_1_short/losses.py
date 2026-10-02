@@ -105,14 +105,15 @@ class SoftcappedCE(torch.autograd.Function):
         prefix_cols_clamped = prefix_cols.clamp(0, M - 1)
 
         dx = torch.zeros(n, D, dtype=torch.float32, device=device)
-        dW = torch.zeros(D, M, dtype=torch.float32, device=device)
+        dW = torch.zeros(D, M, dtype=weight.dtype, device=device)
         for lo in range(0, M, CLS_CHUNK):
             hi = min(lo + CLS_CHUNK, M)
             Wc = weight[:, lo:hi]
             z = _softcap((x @ Wc).float())
             s = z / SOFTCAP_A                       # sigmoid((logit + B) / C), fp32
-            p = (z - lse[:, None]).exp()            # softmax over this chunk's classes
-            dlogit = gs[:, None] * p
+            z.sub_(lse[:, None]).exp_()             # softmax over this chunk's classes (reuses z)
+            dlogit = gs[:, None] * z
+            del z
             # Subtract the weight of every prediction whose target lands on this chunk's columns.
             in_chunk = (cols >= lo) & (cols < hi) & valid                                # [n, K]
             local = (cols - lo).clamp(0, hi - lo - 1)
@@ -123,10 +124,16 @@ class SoftcappedCE(torch.autograd.Function):
             p_in = (prefix_cols >= lo) & (prefix_cols < hi) & pvalid
             if bool(p_in.any()):
                 dlogit[p_in, prefix_cols_clamped[p_in] - lo] -= g[p_in] * prefix_weight
-            dlogit = dlogit * (A_div_C * s * (1 - s))
+            # Softcap derivative folded in place. The per-chunk [n, CLS_CHUNK] fp32 tensors are the
+            # peak of the whole backward on a 16 GB T4, so never materialize A_div_C * s * (1 - s).
+            dlogit.mul_(s).mul_(A_div_C)
+            s.neg_().add_(1)                        # s := 1 - s, the last factor, in place
+            dlogit.mul_(s)
+            del s, in_chunk, local
             # fp16 tensor-core GEMMs; fp32 accumulation only in the fp32 results.
             dx += (dlogit.to(torch.float16) @ Wc).float()
-            dW[:, lo:hi] = (x.T @ dlogit.to(torch.float16)).float()
+            dW[:, lo:hi] = x.T @ dlogit.to(torch.float16)
+            del dlogit
         dx = dx.to(x.dtype)
         dW = dW.to(weight.dtype)
         if vocab_pos is not None:

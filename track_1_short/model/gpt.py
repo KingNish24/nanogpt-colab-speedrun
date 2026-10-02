@@ -89,9 +89,10 @@ NUM_MLP_SLOTS = 12
 MLP_HIDDEN_DIM = 2816
 
 # Validation computes the loss over slabs of this many rows (record #360 used 32768, whose 6.6 GB
-# fp32 [rows, vocab] logits do not fit comfortably next to the rest of a 16 GB T4), so the logit
-# block stays small.
-EVAL_CE_SLAB_ROWS = 8192
+# fp32 [rows, vocab] logits do not fit comfortably next to the rest of a 16 GB T4, and cross_entropy
+# materializes ~2x the logits again internally), so the logit block stays small. Row-local: any slab
+# size gives the identical per-token losses.
+EVAL_CE_SLAB_ROWS = 4096
 
 # relu(x @ c_fc.T)^2 @ c_proj, the record #360 MLP, as the plain differentiable PyTorch expression
 # (the fp8 fused triton kernel needs sm89+ FP8 conversions; the bf16 triton kernel is dropped with it).

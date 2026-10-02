@@ -1,7 +1,7 @@
 """Run configuration: hyperparameters and the training-stage table.
 
 The run's own environment variables (DATA_PATH, NUM_SCHEDULED_ITERATIONS, TRAIN_SEED) are read here.
-The others: PYTORCH_ALLOC_CONF (set by train_gpt.py, before torch imports).
+The others: PYTORCH_CUDA_ALLOC_CONF (set by train_gpt.py, before torch imports).
 
 Provenance: the five-stage table (batch taper, batch-8 extension, seq 3072 under a 2560 attention
 cap, 52 growth steps) is record #360's.
