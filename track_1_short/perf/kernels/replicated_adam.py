@@ -2,9 +2,9 @@
 
 Each element looks up its parameter ("segment") and reads that segment's row of the scalar table:
 beta1, 1-beta1, beta2, 1-beta2, eps, step_size, eff_wd, active. The arithmetic is AnvilAndAdam's
-_adam_update_step statement for statement, in fp32 (bf16 upcast exactly): ATen's add_ / addcmul_
+_adam_update_step statement for statement, in fp32 (fp16 upcast exactly): ATen's add_ / addcmul_
 contract to FFMA under nvcc's default -fmad=true, which the tl.math.fma spellings mirror; tl.sqrt and
-`/` are IEEE (sqrt.rn / div.rn) like ATen's; the bf16 store rounds to nearest even.
+`/` are IEEE (sqrt.rn / div.rn) like ATen's; the fp16 store rounds to nearest even.
 
 Provenance: record #360 (ANVIL2), fuse_tiny_kernels.py `_afe_fused_adam` ("FUSE").
 """
@@ -50,8 +50,9 @@ def _fused_adam_kernel(P, G, EA, ES, SEG, SC, n_elements, BLOCK: tl.constexpr):
 
 def fused_adam_(param: torch.Tensor, grad: torch.Tensor, exp_avg: torch.Tensor, exp_avg_sq: torch.Tensor,
                 segment: torch.Tensor, scalars: torch.Tensor) -> None:
-    """In place over flat buffers: param/grad (same dtype), fp32 moments, int32 segment per element,
-    scalars [segments, len(SCALAR_COLUMNS)] fp32 on the device."""
+    """In place over flat buffers: param/grad/moments (same dtype; moments are fp16 in the T4 port and
+    the register math below stays fp32), int32 segment per element, scalars [segments,
+    len(SCALAR_COLUMNS)] fp32 on the device."""
     n = param.numel()
     _fused_adam_kernel[(triton.cdiv(n, BLOCK),)](param, grad, exp_avg, exp_avg_sq, segment, scalars, n,
                                                  BLOCK=BLOCK, num_warps=4)

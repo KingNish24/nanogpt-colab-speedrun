@@ -47,18 +47,23 @@ def anvil_cascade(grad_chunk: torch.Tensor, velocity: torch.Tensor, momentum_t: 
                   split_baddbmm: bool, fast_beta_t: torch.Tensor, fast_weight_t: torch.Tensor):
     """Twin-rail Nesterov momentum, then the ANVIL cascade that drives every singular value to ~1.
 
-    velocity is one fp32 [2, *chunk] tensor: rail 0 fast, rail 1 slow. Their blend gets a Nesterov
-    lookahead (momentum_t), is cast to fp16 (record #360 used bf16; Turing has no bf16 and fp16 is
-    strictly sharper), normalized by its Frobenius norm, and whitened by ANVIL_MAPS. momentum_t,
-    fast_beta_t and fast_weight_t are 0-D device tensors (AnvilBank).
+    velocity is one [2, *chunk] tensor in the param dtype (fp16 in the T4 port): rail 0 fast,
+    rail 1 slow. Their blend gets a Nesterov lookahead (momentum_t), is cast to fp16 (record #360
+    used bf16; Turing has no bf16 and fp16 is strictly sharper), normalized by its Frobenius norm,
+    and whitened by ANVIL_MAPS. momentum_t, fast_beta_t and fast_weight_t are 0-D device tensors
+    (AnvilBank).
     """
     grad_chunk = grad_chunk.float()
     momentum = momentum_t.to(grad_chunk.dtype)
-    velocity[0].lerp_(grad_chunk, 1 - fast_beta_t.to(grad_chunk.dtype))
-    velocity[1].lerp_(grad_chunk, 1 - RAIL_SLOW_BETA)
+    # The rails are stored in the param dtype (fp16 in the T4 port): round the gradient into the
+    # rail's dtype on the way in, and take the blend back up to fp32 for the Nesterov lookahead.
+    rail_dtype = velocity.dtype
+    g16 = grad_chunk.to(rail_dtype)
+    velocity[0].lerp_(g16, 1 - fast_beta_t.to(grad_chunk.dtype))
+    velocity[1].lerp_(g16, 1 - RAIL_SLOW_BETA)
     w = fast_weight_t.to(grad_chunk.dtype)
-    blend = w * velocity[0] + (1 - w) * velocity[1]
-    g = grad_chunk.lerp_(blend, momentum)
+    blend = w.to(rail_dtype) * velocity[0] + (1 - w).to(rail_dtype) * velocity[1]
+    g = grad_chunk.lerp_(blend.to(grad_chunk.dtype), momentum)
 
     X = g.half().contiguous()
     is_tall = g.size(-2) > g.size(-1)
@@ -347,15 +352,17 @@ class AnvilAndAdam:
                     chunk = param[:p_cfg.chunk_size]
                 else:
                     chunk = param
-                exp_avg = torch.zeros_like(chunk, dtype=torch.float32, device=param.device)
+                # Moments in the param dtype (fp16): the fused Adam kernel does its arithmetic in
+                # fp32 registers and only the storage rounds, halving the state footprint.
+                exp_avg = torch.zeros_like(chunk, dtype=param.dtype, device=param.device)
                 self.param_states[param] = dict(step=0, exp_avg=exp_avg, exp_avg_sq=torch.zeros_like(exp_avg))
 
             elif p_cfg.optim == "anvil":
                 chunk_shape = (p_cfg.chunk_size, *p_cfg.reshape[1:])
 
-                # Twin-rail velocity (FP32 for precision): [0] fast rail, [1] slow rail
+                # Twin-rail velocity (param dtype, fp16: the EMA rounds once per step on the way in)
                 velocity = torch.zeros(
-                    (2, *chunk_shape), dtype=torch.float32, device=param.device
+                    (2, *chunk_shape), dtype=param.dtype, device=param.device
                 )
 
                 # Per-lane update energy for the equalizer - reduced along the longer dimension
@@ -364,7 +371,7 @@ class AnvilAndAdam:
                 else:
                     lane_shape = (*chunk_shape[:-2], 1, chunk_shape[-1])
                 lane_energy = torch.zeros(
-                    lane_shape, dtype=torch.float32, device=param.device
+                    lane_shape, dtype=param.dtype, device=param.device
                 )
 
                 # The fp32 master weight (replaces record #360's uint16 mantissa shadow: fp16's bit
@@ -615,12 +622,18 @@ class AnvilAndAdam:
     @torch.no_grad()
     @staticmethod
     def _adam_update_step(p_slice, g_slice, exp_avg, exp_avg_sq, beta1, beta2, eps, step_size_t, eff_wd_t):
-        """Eager Adam update step: moments stay fp32, the fp16 parameter is written through an fp32
-        round-trip (fp16.add_(fp32) would raise)."""
+        """Eager Adam update step: moments are stored in the param dtype (fp16) but the math runs
+        in fp32 registers and rounds once on the way back to storage - the fused kernel's discipline.
+        The old code did the math in-place on fp32 moments; that raised on fp16.add_(fp32) and, worse,
+        .add_(eps) with eps=1e-8 rounded eps to 0 in fp16, turning 0/(0+eps) into 0/0 = NaN."""
         g = g_slice.float()
-        exp_avg.mul_(beta1).add_(g, alpha=1 - beta1)
-        exp_avg_sq.mul_(beta2).addcmul_(g, g, value=1 - beta2)
-        update = exp_avg.div(exp_avg_sq.sqrt().add_(eps)).mul_(step_size_t)
+        ea = exp_avg.float()
+        es = exp_avg_sq.float()
+        ea.mul_(beta1).add_(g, alpha=1 - beta1)
+        es.mul_(beta2).addcmul_(g, g, value=1 - beta2)
+        update = ea.div(es.sqrt().add_(eps)).mul_(step_size_t)
+        exp_avg.copy_(ea)
+        exp_avg_sq.copy_(es)
         # Cautious weight decay
         p_f = p_slice.float()
         mask = (update * p_f) > 0
@@ -671,7 +684,9 @@ class AnvilAndAdam:
         lane_len = v_chunk.size(red_dim)
         pre_norm = lane_power.sum(dim=(-2, -1), keepdim=True).mul_(lane_len).sqrt_()
         lane_energy.lerp_(lane_power.to(dtype=lane_energy.dtype), 1 - beta2)
-        lane_gain = lane_energy.clamp_min(1e-10).rsqrt_()
+        # The gain math is fp32 on purpose: lane_energy is fp16, where clamp_min(1e-10) would
+        # round the floor to 0 and rsqrt(0) = inf would poison the first step from zero state.
+        lane_gain = lane_energy.float().clamp_min(1e-10).rsqrt_()
         post_power = (lane_power * lane_len) * lane_gain.float().square()
         post_norm = post_power.sum(dim=(-2, -1), keepdim=True).sqrt_()
         eq_scale = lane_gain * (pre_norm / post_norm.clamp_min_(1e-10))

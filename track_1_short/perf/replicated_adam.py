@@ -42,8 +42,8 @@ class FlatGroup:
     params: list[nn.Parameter]
     grad: Tensor        # the flat gradient buffer
     param: Tensor       # every parameter's .data is a view of this
-    exp_avg: Tensor     # fp32
-    exp_avg_sq: Tensor  # fp32
+    exp_avg: Tensor     # the group's dtype (fp16; the kernel's math stays fp32 in registers)
+    exp_avg_sq: Tensor  # the group's dtype
     segment: Tensor     # int32 per element: the parameter's row in the scalar table
     grad_views: dict[nn.Parameter, Tensor]
 
@@ -61,15 +61,15 @@ def flatten_replicated(params: list[nn.Parameter], param_states: dict, device: t
             params=members,
             grad=torch.zeros(n, dtype=dtype, device=device),
             param=torch.empty(n, dtype=dtype, device=device),
-            exp_avg=torch.empty(n, dtype=torch.float32, device=device),
-            exp_avg_sq=torch.empty(n, dtype=torch.float32, device=device),
+            exp_avg=torch.empty(n, dtype=dtype, device=device),
+            exp_avg_sq=torch.empty(n, dtype=dtype, device=device),
             segment=torch.empty(n, dtype=torch.int32, device=device),
             grad_views={},
         )
         offset = 0
         for p in members:
             state = param_states[p]
-            assert state["exp_avg"].dtype == torch.float32 and state["exp_avg"].shape == p.shape
+            assert state["exp_avg"].dtype == dtype and state["exp_avg"].shape == p.shape
             span = slice(offset, offset + p.numel())
             offset += p.numel()
             group.param[span].copy_(p.data.reshape(-1))
