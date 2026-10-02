@@ -60,6 +60,19 @@ from track_1_short.training import TrainingManager
 # Step lines in the timed loop (console and log): every Nth step, plus the last two (record #360).
 PRINT_EVERY = 25
 
+# Per-phase timers, cumulative seconds since the clock started (option-1 instrumentation):
+# data = batch wait inside batches.peek; cand = candidate upload/gather host time; fwd/bwd = CUDA-event
+# GPU spans; opt = optimizer step (ends with a sync); other = the rest of train_time (Python enqueue,
+# one-time builds). Reset at clock start, printed on every step line.
+PHASE = {"data": 0.0, "cand": 0.0, "fwd": 0.0, "bwd": 0.0, "opt": 0.0}
+
+
+def _collect_gpu_phases(pairs) -> None:
+    """Fold this step's fwd/bwd CUDA-event spans into PHASE (call after a synchronize)."""
+    for start, mid, end in pairs:
+        PHASE["fwd"] += start.elapsed_time(mid) / 1000.0
+        PHASE["bwd"] += mid.elapsed_time(end) / 1000.0
+
 
 def slice_seqlens(ends: list[int], a: int, n: int, cap: int | None = None) -> torch.Tensor:
     """The attention-segment boundaries of rows [a, a + n) as a cumulative list [0, ..., n].
@@ -103,7 +116,9 @@ def train_step(training_manager, model: nn.Module, sampled_softmax: SampledSoftm
     Non-finite losses (fp16 overflow spikes) skip the whole step: its gradients are dropped and the
     scale halved.
     """
+    t = time.perf_counter()
     batch = batches.peek(step)
+    PHASE["data"] += time.perf_counter() - t
     inputs, targets, cpu_targets = batch.inputs, batch.targets, batch.targets_cpu
     total_tokens = inputs.shape[0]
     assert total_tokens % MICRO_BATCH_TOKENS == 0, \
@@ -117,6 +132,7 @@ def train_step(training_manager, model: nn.Module, sampled_softmax: SampledSoftm
 
     loss_sum = torch.zeros((), dtype=torch.float32, device=inputs.device)
     finite = torch.ones((), dtype=torch.bool, device=inputs.device)
+    fwd_bwd_events = []
     for m in range(n_micro):
         a = m * MICRO_BATCH_TOKENS
         n = MICRO_BATCH_TOKENS
@@ -127,6 +143,7 @@ def train_step(training_manager, model: nn.Module, sampled_softmax: SampledSoftm
             # (perf/sampled_softmax_overlap.py). upload takes this microbatch's build (prefetched at
             # the previous iteration's start, so the host work hides under forward/backward; the
             # first microbatch of a step builds inline, ~1 ms).
+            t = time.perf_counter()
             sampled_softmax.upload(step, cpu_targets[a:ext])
             sl = sampled_softmax.gather(step, model.lm_head_weight)
             # The loss reads target_pos[0 : n + K - 1] (MTP) and prefix_pos[0 : n]; the shared
@@ -137,23 +154,35 @@ def train_step(training_manager, model: nn.Module, sampled_softmax: SampledSoftm
             if m + 1 < n_micro:
                 a2, ext2 = a + n, min(a + 2 * n + lookahead, total_tokens)
                 sampled_softmax.prefetch(step, cpu_targets[a2:ext2])
+            PHASE["cand"] += time.perf_counter() - t
+        ev0, ev1, ev2 = (torch.cuda.Event(enable_timing=True) for _ in range(3))
+        ev0.record()
         loss = model(
             input_seq=inputs[a:a + n],
             target_seq=targets[a:ext],
             seqlens=slice_seqlens(ends, a, n),
             schedule_cfg=training_manager.get_forward_args(sampled_loss),
         )  # [n] fp32 per-token loss
+        ev1.record()
         finite = finite & torch.isfinite(loss).all()
         loss_sum = loss_sum + loss.detach().sum()
         # One optimizer step's worth of the batch mean, scaled for fp16 gradients.
         (loss.mean() * (loss_scale / n_micro)).backward()
+        ev2.record()
+        fwd_bwd_events.append((ev0, ev1, ev2))
         sampled_softmax.mark_readers_done()
     batches.take(step)
 
     if not bool(finite):
+        torch.cuda.synchronize()
+        _collect_gpu_phases(fwd_bwd_events)
         model.zero_grad(set_to_none=True)
         return 0.0, True, loss_scale * 0.5
+    t = time.perf_counter()
     training_manager.step_optimizers(step)
+    torch.cuda.synchronize()
+    PHASE["opt"] += time.perf_counter() - t
+    _collect_gpu_phases(fwd_bwd_events)
     return float(loss_sum / total_tokens), False, loss_scale
 
 
@@ -293,6 +322,8 @@ def main():
     model.limit_yarn_rebuild(MICRO_BATCH_TOKENS)
 
     training_time_ms = 0
+    for k in PHASE:
+        PHASE[k] = 0.0
     # start the clock
     torch.cuda.synchronize()
     t0 = time.perf_counter()
@@ -317,18 +348,22 @@ def main():
                 canon_mask_builder.collect(model.canon_mask)
                 # On the clock: evaluate (and keep) the tail-averaged weights, not the final iterate.
                 tail_averages.ship()
+            # stop the clock: from here to the restart is validation, timed as val_time (the yarn
+            # table completion and the val batch loads are validation's cost, not training's).
+            torch.cuda.synchronize()
+            training_time_ms += 1000 * (time.perf_counter() - t0)
+            val_t0 = time.perf_counter()
             model.complete_yarn_tables()
             assert args.val_tokens % args.val_batch_size == 0
             val_steps = args.val_tokens // args.val_batch_size
             val_loader_iter = val_loader()
             val_batches = [next(val_loader_iter) for _ in range(val_steps)]
             del val_loader_iter
-            # stop the clock
-            torch.cuda.synchronize()
-            training_time_ms += 1000 * (time.perf_counter() - t0)
             val_loss = evaluate(model, training_manager, val_batches)
             del val_batches
-            print0(f"step:{step}/{training_schedule.total_steps} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/max(step, 1):.2f}ms", console=True)
+            val_ms = 1000 * (time.perf_counter() - val_t0)
+            print0(f"step:{step}/{training_schedule.total_steps} val_loss:{val_loss:.4f} val_time:{val_ms:.0f}ms "
+                   f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/max(step, 1):.2f}ms", console=True)
             # The clock is stopped: flush the log and collect the loop's garbage here.
             flush_log()
             gc.collect()
@@ -357,7 +392,11 @@ def main():
         if (step + 1) % PRINT_EVERY == 0 or step + 1 >= training_schedule.total_steps - 1:
             approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)
             loss_str = f" loss:{batch_loss:.4f}" if not skipped else ""
-            print0(f"step:{step+1}/{training_schedule.total_steps} train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms/(step + 1):.2f}ms{loss_str}", console=True)
+            phase_str = " ".join(f"{k}:{v:.1f}s" for k, v in PHASE.items())
+            other = max(0.0, approx_training_time_ms / 1000 - sum(PHASE.values()))
+            print0(f"step:{step+1}/{training_schedule.total_steps} train_time:{approx_training_time_ms:.0f}ms "
+                   f"step_avg:{approx_training_time_ms/(step + 1):.2f}ms{loss_str} "
+                   f"| {phase_str} other:{other:.1f}s", console=True)
 
     gc.enable()
     if args.run_evals:
