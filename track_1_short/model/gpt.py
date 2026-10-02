@@ -97,7 +97,9 @@ EVAL_CE_SLAB_ROWS = 8192
 # (the fp8 fused triton kernel needs sm89+ FP8 conversions; the bf16 triton kernel is dropped with it).
 # https://arxiv.org/abs/2109.08668v2; ~1-2% better than GELU; suggested by @SKYLINEZ007 and @Grad62304977
 def ReLUSqrdMLP(x_normed, c_fc, c_proj):
-    return F.linear(F.relu(F.linear(x_normed, c_fc)).square(), c_proj)
+    # mlp_bank stores both matrices as (mlp_hdim, dim); c_fc coincides with F.linear's (out, in)
+    # convention, c_proj must be transposed to (dim, mlp_hdim) for it.
+    return F.linear(F.relu(F.linear(x_normed, c_fc)).square(), c_proj.T)
 
 @dataclass(slots=True)
 class ForwardScheduleConfig:
