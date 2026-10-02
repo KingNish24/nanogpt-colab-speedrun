@@ -23,8 +23,9 @@ Provenance: loss formula and softcap constants from record #360 (ANVIL2); port f
 import torch
 
 SOFTCAP_A, SOFTCAP_B, SOFTCAP_C = 23.0, 5.0, 7.5
-# Class rows per logits chunk: [MICRO_BATCH, CLS_CHUNK] fp32 = 33.5 MB at the training microbatch.
-CLS_CHUNK = 1024
+# Class rows per logits chunk: [MICRO_BATCH, CLS_CHUNK] fp32 = 128 MiB at the training microbatch.
+# (Validation doesn't run through here: gpt.py's eval branch slabs the rows and calls F.cross_entropy.)
+CLS_CHUNK = 4096
 
 
 def _softcap(logits: torch.Tensor) -> torch.Tensor:
@@ -115,15 +116,15 @@ class SoftcappedCE(torch.autograd.Function):
             dlogit = gs[:, None] * z
             del z
             # Subtract the weight of every prediction whose target lands on this chunk's columns.
+            # No emptiness guard: a masked index_put with no selected rows is a no-op, and skipping
+            # it would put a data-dependent bool() in the compiled graph (a dynamo graph break).
             in_chunk = (cols >= lo) & (cols < hi) & valid                                # [n, K]
             local = (cols - lo).clamp(0, hi - lo - 1)
             for k in range(K):
                 rows = in_chunk[:, k]
-                if bool(rows.any()):
-                    dlogit[rows, local[rows, k]] -= g[rows] * mtp_weights[k]
+                dlogit[rows, local[rows, k]] -= g[rows] * mtp_weights[k]
             p_in = (prefix_cols >= lo) & (prefix_cols < hi) & pvalid
-            if bool(p_in.any()):
-                dlogit[p_in, prefix_cols_clamped[p_in] - lo] -= g[p_in] * prefix_weight
+            dlogit[p_in, prefix_cols_clamped[p_in] - lo] -= g[p_in] * prefix_weight
             # Softcap derivative folded in place. The per-chunk [n, CLS_CHUNK] fp32 tensors are the
             # peak of the whole backward on a 16 GB T4, so never materialize A_div_C * s * (1 - s).
             dlogit.mul_(s).mul_(A_div_C)
@@ -153,3 +154,10 @@ def softcapped_ce(x, weight, lm_head_weight, mtp_weights, prefix_weight, target_
     """SoftcappedCE over `weight`'s columns; see SoftcappedCE."""
     return SoftcappedCE.apply(x, weight, lm_head_weight, mtp_weights.float(), prefix_weight,
                               target_cols, prefix_cols, vocab_pos)
+
+
+# Static shapes (micro x class chunk): compile both directions of the chunked CE -- aot_autograd
+# traces the custom Function's backward too. Specializes per (n, M, K, sampled?) combination:
+# ~6 variants over a run, each compiled on first use. The name is rebound before gpt.py does
+# `from track_1_short.losses import softcapped_ce`, so the model calls the compiled function.
+softcapped_ce = torch.compile(softcapped_ce, dynamic=False)
