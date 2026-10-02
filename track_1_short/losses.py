@@ -23,8 +23,8 @@ Provenance: loss formula and softcap constants from record #360 (ANVIL2); port f
 import torch
 
 SOFTCAP_A, SOFTCAP_B, SOFTCAP_C = 23.0, 5.0, 7.5
-# Class rows per logits chunk: [MICRO_BATCH, CLS_CHUNK] fp32 = 134 MB at the training microbatch.
-CLS_CHUNK = 2048
+# Class rows per logits chunk: [MICRO_BATCH, CLS_CHUNK] fp32 = 33.5 MB at the training microbatch.
+CLS_CHUNK = 1024
 
 
 def _softcap(logits: torch.Tensor) -> torch.Tensor:

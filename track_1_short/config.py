@@ -57,8 +57,9 @@ SCHEDULE_GROWTH_STAGE = 2
 # Attention window sizes are counted in blocks of this many tokens (record #360).
 BLOCK_SIZE = 128
 # Tokens per forward pass on the T4: every stage's global batch splits into a whole number of
-# microbatches of this size, whose gradients are accumulated into one optimizer step.
-MICRO_BATCH_TOKENS = 16384
+# microbatches of this size, whose gradients are accumulated into one optimizer step (the step math
+# is identical at any micro size; 8192 halves the activation and loss-chunk peak vs 16384).
+MICRO_BATCH_TOKENS = 8192
 # Static loss scale for fp16 (Q7): grads are held this far above fp16's smallest normals; halved on
 # any non-finite gradient (train_gpt.py's isfinite guard).
 LOSS_SCALE = 1024.0
