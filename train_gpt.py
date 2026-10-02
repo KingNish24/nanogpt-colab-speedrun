@@ -57,8 +57,9 @@ from track_1_short.schedule import TrainingSchedule
 from track_1_short.tail_average import TailAverages
 from track_1_short.training import TrainingManager
 
-# Step lines in the timed loop (console and log): every Nth step, plus the last two (record #360).
-PRINT_EVERY = 25
+# Step lines in the timed loop (console and log): every Nth step (override: PRINT_EVERY=5), plus
+# the last two (record #360).
+PRINT_EVERY = int(os.environ.get("PRINT_EVERY", "10"))
 
 # Per-phase timers, cumulative seconds since the clock started (option-1 instrumentation):
 # data = batch wait inside batches.peek; cand = candidate upload/gather host time; fwd/bwd = CUDA-event
