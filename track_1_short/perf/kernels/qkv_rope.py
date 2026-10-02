@@ -49,7 +49,7 @@ def qk_norm_rope(qk, factor1, factor2, num_heads, rotary_dim, paired, key_offset
     if key_offset:
         # A key's stationary dims come from the previous token's normed row (its own rstd);
         # token 0 keeps its own row (the mask's token > 0 excludes it).
-        prev_x = torch.cat((x[:, :1], x[:, :-1]), dim=0)
+        prev_x = torch.cat((x[:1], x[:-1]), dim=0)
         prev_norm = prev_x * torch.rsqrt(prev_x.square().mean(dim=-1, keepdim=True) + 1.1920928955078125e-7)
         shift = (torch.arange(tokens, device=qk.device) > 0)[:, None] & \
                 (torch.arange(qk_dim, device=qk.device) >= rotary_dim)[None, :]   # [T, D]
