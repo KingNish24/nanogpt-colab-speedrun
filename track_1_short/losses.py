@@ -131,7 +131,8 @@ class SoftcappedCE(torch.autograd.Function):
             dlogit.mul_(s)
             del s, in_chunk, local
             # fp16 tensor-core GEMMs; fp32 accumulation only in the fp32 results.
-            dx += (dlogit.to(torch.float16) @ Wc).float()
+            # weight is [D, M] (in, out): dx = dlogit @ Wc.T, dW = x.T @ dlogit.
+            dx += (dlogit.to(torch.float16) @ Wc.T).float()
             dW[:, lo:hi] = x.T @ dlogit.to(torch.float16)
             del dlogit
         dx = dx.to(x.dtype)
